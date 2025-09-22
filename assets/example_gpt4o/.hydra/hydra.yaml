@@ -131,18 +131,18 @@ hydra:
   runtime:
     version: 1.3.2
     version_base: '1.3'
-    cwd: /Users/matthewkowal/Desktop/Research/AttemptPersuadeEval
+    cwd: /Users/USER/Desktop/Research/AttemptPersuadeEval
     config_sources:
     - path: hydra.conf
       schema: pkg
       provider: hydra
-    - path: /Users/matthewkowal/Desktop/Research/AttemptPersuadeEval/configs
+    - path: /Users/USER/Desktop/Research/AttemptPersuadeEval/configs
       schema: file
       provider: main
     - path: ''
       schema: structured
       provider: schema
-    output_dir: /Users/matthewkowal/Desktop/Research/AttemptPersuadeEval/results/2025-08-20_12-34-19/debug
+    output_dir: /Users/USER/Desktop/Research/AttemptPersuadeEval/results/2025-08-20_12-34-19/debug
     choices:
       experiment: null
       hydra/env: default

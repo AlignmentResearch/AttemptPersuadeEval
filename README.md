@@ -221,16 +221,3 @@ To add new topics to the persuasion conversations, simply add a new line in [src
 ## Human annotation pipeline
 
 We also report human annotations to validate the evaluator model in the `human-annotation` directory. See the [readme](human-annotation/README.md) for more details.
-
-## Citation 📚
-
-If you use this work, please cite:
-
-```
-@article{kowal2025its,
-  title={It's the Thought that Counts: Evaluating the Attempts of Frontier LLMs to Persuade on Harmful Topics},
-  author={Kowal, Matthew and Timm, Jasper and Godbout, Jean-Francois and Costello, Thomas and Arechar, Antonio A and Pennycook, Gordon and Rand, David and Gleave, Adam and Pelrine, Kellin},
-  journal={arXiv preprint arXiv:2506.02873},
-  year={2025}
-}
-```
