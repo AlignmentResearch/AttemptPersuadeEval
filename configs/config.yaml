@@ -18,6 +18,7 @@ persuader_model: gpt-4o
 persuadee_model: gpt-4o
 evaluator_model: gpt-4o
 reject_model: gpt-4o-mini
+reasoning_effort_persuader: null
 
 # Jailbreaking options
 jailbreak_persuader: false

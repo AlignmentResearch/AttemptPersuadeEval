@@ -90,6 +90,7 @@ def main(cfg: DictConfig) -> None:
     PERSUADEE_MODEL = cfg.persuadee_model
     EVALUATOR_MODEL = cfg.evaluator_model
     REJECT_MODEL = cfg.reject_model
+    REASONING_EFFORT_PERSUADER = cfg.reasoning_effort_persuader
     JAILBREAK_TUNING_POSTPROCESS = cfg.jailbreak_persuader
     JAILBREAK_TUNING_PERSUADEE = cfg.jailbreak_persuadee
     EXPERIMENT_NAME = cfg.experiment_name
@@ -177,6 +178,7 @@ def main(cfg: DictConfig) -> None:
         "PERSUADEE_MODEL": PERSUADEE_MODEL,
         "EVALUATOR_MODEL": EVALUATOR_MODEL,
         "REJECT_MODEL": REJECT_MODEL,
+        "REASONING_EFFORT_PERSUADER": REASONING_EFFORT_PERSUADER,
         "JAILBREAK_TUNING_POSTPROCESS": JAILBREAK_TUNING_POSTPROCESS,
         "RECORD_ALL_SYSTEM": cfg.record_all_system,
         "REMOVE_RATINGS": cfg.remove_ratings,
@@ -470,6 +472,7 @@ def main(cfg: DictConfig) -> None:
             model=PERSUADER_MODEL,
             postprocess_responses=JAILBREAK_TUNING_POSTPROCESS,
             remove_ratings=cfg.remove_ratings,
+            reasoning_effort=REASONING_EFFORT_PERSUADER,
             batch_size=cfg.batch_size,
         )
 
@@ -660,6 +663,7 @@ def main(cfg: DictConfig) -> None:
                 model=PERSUADER_MODEL,
                 postprocess_responses=JAILBREAK_TUNING_POSTPROCESS,
                 remove_ratings=cfg.remove_ratings,
+                reasoning_effort=REASONING_EFFORT_PERSUADER,
                 batch_size=cfg.batch_size,
             )
 

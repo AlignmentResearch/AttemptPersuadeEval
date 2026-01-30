@@ -69,10 +69,23 @@ huggingface-cli download Qwen/Qwen3-32B-Instruct --local-dir src/ckpts/Qwen3-32B
 
 ### Install dependencies
 
-Dependencies are in `pyproject.toml`, install them with:
+Locked dependency versions are recorded in `reqs.txt` (generated from `pyproject.toml`).
+Install them with:
 
 ```bash
-pip install -e ".[dev,test]"
+pip install -r reqs.txt
+```
+
+For development and testing you can use:
+
+```bash
+pip install -r reqs-dev.txt
+```
+
+And for all dependencies including those required for running local models:
+
+```bash
+pip install -r reqs-all.txt
 ```
 
 ### Execute evals

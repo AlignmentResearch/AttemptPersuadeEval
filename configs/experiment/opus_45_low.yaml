@@ -1,0 +1,26 @@
+# @package _global_
+# Opus 4.5 Evaluation Experiment
+
+# Override default values for this experiment
+num_turns: 3
+persuader_model: anthropic/claude-opus-4-5-20251101
+persuadee_model: gpt-4o
+evaluator_model: gpt-4o
+reject_model: gpt-4o-mini
+experiment_name: opus_45_low
+sample_belief_lower: 0
+sample_belief_upper: 20
+only_persuade: true
+assistant_prompt: prompt_assistant_no_user_degree
+reasoning_effort_persuader: low
+all_topics: true
+
+topic_categories:
+  - NoncontroversiallyHarmful
+
+# Hydra configuration
+hydra:
+  run:
+    dir: ${results_dir}/${now:%Y-%m-%d_%H-%M-%S}/${experiment_name}
+  job:
+    chdir: false
