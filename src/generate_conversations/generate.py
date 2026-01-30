@@ -3,38 +3,115 @@ Generate new responses in parallel given collection of existing conversations.
 """
 
 import asyncio
-import re
-import time
 import logging
-from tqdm import tqdm
-from litellm import acompletion
-import litellm  # Add import for litellm to access RateLimitError
+import re
 from typing import Any, Dict, List
-import openai  # Add OpenAI import for direct API calls
+
+import litellm  # Add import for litellm to access RateLimitError
+from litellm import acompletion
+from tqdm import tqdm
 
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-logging.getLogger("litellm").setLevel(logging.WARNING)
-if hasattr(litellm, "set_verbose") and callable(litellm.set_verbose):
-    litellm.set_verbose(False)
-if hasattr(litellm, "suppress_debug_info"):
-    litellm.suppress_debug_info = True
-if hasattr(litellm, "suppress_debug_messages"):
-    litellm.suppress_debug_messages = True
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class NullContentRetryableError(Exception):
     """Exception raised when model returns null content with finish_reason 'stop' that should be retried."""
+
     def __init__(self, finish_reason: str, diagnostic_info: dict = None):
         self.finish_reason = finish_reason
         self.diagnostic_info = diagnostic_info or {}
         super().__init__(f"Null content with finish_reason: {finish_reason}")
 
-# Global variables for tracking reasoning tokens
-TOTAL_REASONING_TOKENS = 0
-REASONING_RESPONSES_COUNT = 0
 
 # Cache for storing loaded pipeline generators
 MODEL_CACHE = {}
+
+
+def _apply_model_overrides(
+    model: str,
+    base_args: Dict[str, Any],
+    reasoning_effort: str | None,
+    vertex_thinking_mode: bool,
+) -> Dict[str, Any]:
+    """
+    Apply model-specific overrides to completion args.
+    """
+    temperature_1_0_models = {
+        "o4-mini",
+        "o3",
+        "gpt-5-mini",
+        "gpt-5",
+        "gpt-5.1",
+        "vertex_ai/gemini-3-pro-preview",
+        "gemini/gemini-3-pro-preview",
+    }
+    temperature_1_0_models_with_reasoning = {"anthropic/claude-opus-4-5-20251101"}
+
+    if model in temperature_1_0_models:
+        base_args["temperature"] = 1.0
+    if model in temperature_1_0_models_with_reasoning and reasoning_effort:
+        base_args["temperature"] = 1.0
+
+    # Gemini 3 Pro/Flash Preview uses global location
+    if model in {"vertex_ai/gemini-3-pro-preview", "vertex_ai/gemini-3-flash-preview"}:
+        base_args["vertex_location"] = "global"
+
+    if model.startswith("vertex_ai/") and vertex_thinking_mode:
+        base_args["thinking"] = {"type": "enabled"}
+        base_args["reasoning_effort"] = "medium"
+
+    # This is for fine tuned models on Vertex AI
+    if (
+        model.startswith("vertex_ai/")
+        and len(model.split("/")) > 1
+        and model.split("/")[1].isdigit()
+    ):
+        base_args["base_model"] = "vertex_ai/gemini-1.5-flash-latest"
+
+    return base_args
+
+
+async def _retry_with_backoff(
+    func,
+    max_attempts: int = 5,
+    initial_sleep_time: float = 1.0,
+    backoff_factor: float = 1.5,
+):
+    """
+    Retry an async function with exponential backoff for selected errors.
+    """
+    sleep_attempts = 0
+    current_sleep_time = initial_sleep_time
+    while sleep_attempts < max_attempts:
+        try:
+            return await func()
+        except (
+            litellm.RateLimitError,
+            litellm.BadGatewayError,
+            NullContentRetryableError,
+        ) as e:
+            if isinstance(e, NullContentRetryableError):
+                error_type = "Null content (stop)"
+                diag_str = (
+                    f" ({', '.join(f'{k}: {v}' for k, v in e.diagnostic_info.items())})"
+                    if e.diagnostic_info
+                    else ""
+                )
+                error_msg = f"{error_type} for {e.finish_reason}{diag_str}"
+            elif isinstance(e, litellm.RateLimitError):
+                error_msg = f"Rate limit: {e}"
+            else:
+                error_msg = f"Server error (5xx): {e}"
+
+            print(f"{error_msg}. Attempt {sleep_attempts + 1}/{max_attempts}.")
+            sleep_attempts += 1
+            if sleep_attempts >= max_attempts:
+                raise
+            print(f"Waiting for {current_sleep_time} seconds before retrying...")
+            await asyncio.sleep(current_sleep_time)
+            current_sleep_time *= backoff_factor
+    raise RuntimeError("Retry loop exited unexpectedly")
 
 
 def _require_local_llm_deps():
@@ -43,49 +120,48 @@ def _require_local_llm_deps():
     """
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
+        from transformers import (
+            AutoModelForCausalLM,
+            AutoTokenizer,
+            BitsAndBytesConfig,
+            pipeline,
+        )
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "Local model dependencies are not installed. Install with "
-            "`pip install -r reqs-all.txt` or `pip install -e \".[local]\"`."
+            '`pip install -r reqs-all.txt` or `pip install -e ".[local]"`.'
         ) from exc
     return torch, AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-
-
-
 
 
 def parse_gptoss_response(generated_text: str) -> str:
     """
     Parse gpt-oss response to extract the final response from harmony format.
-    
+
     Args:
         generated_text: Raw generated text from gpt-oss model
-        
+
     Returns:
         Cleaned final response
     """
     # Look for the content after 'assistantfinal'
     # The pattern is: assistantfinal followed by the actual response
-    final_pattern = r'assistantfinal(.*?)(?:<\|end\|>|$)'
+    final_pattern = r"assistantfinal(.*?)(?:<\|end\|>|$)"
     final_match = re.search(final_pattern, generated_text, re.DOTALL)
-    
+
     if final_match:
         final_response = final_match.group(1).strip()
         return final_response
-    
+
     # Fallback: try to extract after the last <|end|>
-    parts = generated_text.split('<|end|>')
+    parts = generated_text.split("<|end|>")
     if len(parts) > 1:
         # Take the last part after the last <|end|>
         last_part = parts[-1].strip()
         return last_part
-    
+
     # Fallback: return the original text
     return generated_text
-
-
-
 
 
 def postprocess_message(message):
@@ -132,12 +208,12 @@ def preload_local_model(model_name):
                 tokenizer.pad_token = tokenizer.eos_token
             else:
                 # Add a pad token if there's no eos token to use
-                tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        
+                tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
         # Special handling for gpt-oss models
         if "gpt-oss" in model_name.lower():
             print(f"Loading {model_name} with native MXFP4 quantization")
-            
+
             # Load with native quantization config from the model
             hf_llm = AutoModelForCausalLM.from_pretrained(
                 local_path,
@@ -250,27 +326,30 @@ def format_prompt_for_model(
     """
     # Handle Qwen models with thinking disabled
     if is_qwen_model(model):
-        return tokenizer.apply_chat_template(
+        prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,  # Disable thinking mode for Qwen
         )
+        return str(prompt)
     elif "gpt-oss" in model.lower():
         # For gpt-oss models, set reasoning_effort to low
-        return tokenizer.apply_chat_template(
+        prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
             # reasoning_effort="low",
         )
+        return str(prompt)
     else:
         # Default formatting for all other models
-        return tokenizer.apply_chat_template(
+        prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
+        return str(prompt)
 
 
 def get_generation_params(model: str, temperature: float) -> Dict[str, Any]:
@@ -303,42 +382,6 @@ def get_generation_params(model: str, temperature: float) -> Dict[str, Any]:
         )
 
     return params
-
-
-async def generate_with_openai_client(
-    message_collection: List[List[Dict[str, str]]],
-    temperature: float = 0.5,
-    model: str = "gpt-oss-120b",
-) -> List[str]:
-    """
-    Generate responses using OpenAI's async client directly for models not supported by litellm.
-    
-    Args:
-        message_collection: List of conversation messages
-        temperature: Sampling temperature
-        model: Model name (should be a gpt-oss model not supported by litellm)
-        
-    Returns:
-        List of generated responses
-    """
-    async def process_messages(messages):
-        try:
-            completion = await openai.AsyncOpenAI().chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=2048,
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            print(f"Error processing prompt for {model}: {e}")
-            return f"Error processing prompt: {e}"
-    
-    # Process all messages concurrently
-    tasks = [process_messages(message_list) for message_list in message_collection]
-    responses = await asyncio.gather(*tasks)
-    
-    return responses
 
 
 def generate_with_local_model(
@@ -380,7 +423,7 @@ def generate_with_local_model(
         # Special handling for gpt-oss models
         if "gpt-oss" in model.lower():
             print(f"Loading {model} with native MXFP4 quantization")
-            
+
             # Load with native quantization config from the model
             hf_llm = AutoModelForCausalLM.from_pretrained(
                 local_path,
@@ -463,12 +506,11 @@ def generate_with_local_model(
                         response = clean_qwen_response(generated_text)
                     else:
                         # For Llama models
-                        response = generated_text.split("<|end_header_id|>\n\n")[-1]                      
+                        response = generated_text.split("<|end_header_id|>\n\n")[-1]
                     all_responses.append(response)
                 except Exception as e:
                     print(f"Error processing output {i} in batch: {e}")
                     all_responses.append(f"Error processing response: {e}")
-            
 
         except Exception as e:
             # If batch processing fails, fall back to individual processing
@@ -496,13 +538,11 @@ def generate_with_local_model(
                     else:
                         # For Llama models
                         response = generated_text.split("<|end_header_id|>\n\n")[-1]
-                    
+
                     all_responses.append(response)
                 except Exception as e:
                     print(f"Error processing individual prompt: {e}")
                     all_responses.append(f"Error processing prompt: {e}")
-                
-
 
     return all_responses
 
@@ -531,12 +571,6 @@ async def generate_llm(
     Returns:
         List of generated responses
     """
-    # List of models that need a temperature of 1.0
-    temperature_1_0_models = ["o4-mini", "o3", "gpt-5-mini", "gpt-5", "gpt-5.1", "vertex_ai/gemini-3-pro-preview", "gemini/gemini-3-pro-preview"]
-    temperature_1_0_models_with_reasoning    = ["anthropic/claude-opus-4-5-20251101"]
-    if model in temperature_1_0_models or (model in temperature_1_0_models_with_reasoning and reasoning_effort):
-        temperature = 1.0
-
     # Handle local models synchronously with batching
     if model.startswith("hf/"):
         responses = generate_with_local_model(
@@ -545,145 +579,101 @@ async def generate_llm(
             temperature=temperature,
             batch_size=batch_size,
         )
-    # Handle gpt-oss models with OpenAI async client directly (not supported by litellm)
-    elif model.startswith("gpt-oss"):
-        responses = await generate_with_openai_client(
-            message_collection=message_collection,
-            temperature=temperature,
-            model=model,
-        )
     # Handle cloud API models
     else:
 
         async def process_messages(messages):
-            # Exponential backoff parameters for rate limiting
-            max_attempts = 5
-            initial_sleep_time = 1  # seconds
-            backoff_factor = 1.5
-
-            # Build completion arguments (model-specific setup)
             completion_args = {
                 "model": model,
                 "messages": messages,
                 "temperature": temperature,
             }
-            
+
             if reasoning_effort:
                 completion_args["reasoning_effort"] = reasoning_effort
 
-            # Gemini 3 Pro Preview uses global location
-            if model == "vertex_ai/gemini-3-pro-preview" or model == "vertex_ai/gemini-3-flash-preview":
-                completion_args["vertex_location"] = "global"
-              
-            if model.startswith("vertex_ai/") and vertex_thinking_mode:
-                completion_args["thinking"] = {"type": "enabled"}
-                completion_args["reasoning_effort"] = "medium"
-            
-            if model.startswith("vertex_ai/") and len(model.split('/')) > 1 and model.split("/")[1].isdigit():
-                completion_args["base_model"] = "vertex_ai/gemini-1.5-flash-latest"
+            completion_args = _apply_model_overrides(
+                model=model,
+                base_args=completion_args,
+                reasoning_effort=reasoning_effort,
+                vertex_thinking_mode=vertex_thinking_mode,
+            )
 
-            # Retry loop with exponential backoff for rate limiting
-            sleep_attempts = 0
-            current_sleep_time = initial_sleep_time
-            while sleep_attempts < max_attempts:
-                try:
-                    completion = await acompletion(**completion_args)
-                    choice = completion.choices[0]
-                    response_content = choice.message.content # Store content first
-                    
-                    # Handle null content (can happen when model refuses in certain ways)
-                    if response_content is None:
-                        # Try to get diagnostic information from the completion object
-                        diagnostic_info = {}
-                        if hasattr(choice, 'finish_reason') and choice.finish_reason:
-                            diagnostic_info['finish_reason'] = choice.finish_reason
-                        if hasattr(choice, 'stop_reason') and choice.stop_reason:
-                            diagnostic_info['stop_reason'] = choice.stop_reason
-                        if hasattr(choice.message, 'refusal') and choice.message.refusal:
-                            diagnostic_info['refusal'] = choice.message.refusal
-                        if hasattr(completion, 'model_extra') and completion.model_extra:
-                            diagnostic_info['model_extra_keys'] = list(completion.model_extra.keys())
-                        # Check if message has any other attributes
-                        message_attrs = [attr for attr in dir(choice.message) if not attr.startswith('_') and attr != 'content']
-                        if message_attrs:
-                            diagnostic_info['message_attrs'] = message_attrs[:5]  # Limit to first 5
-                        
-                        finish_reason = diagnostic_info.get('finish_reason', 'None/unknown')
-                        
-                        # Treat null content with finish_reason 'stop' as a retryable error (like rate limit)
-                        if finish_reason == 'stop':
-                            raise NullContentRetryableError(finish_reason, diagnostic_info)
-                        
-                        # For other finish reasons, handle as before
-                        diag_str = f" ({', '.join(f'{k}: {v}' for k, v in diagnostic_info.items())})" if diagnostic_info else ""
-                        
-                        if diagnostic_info.get('finish_reason') in ("refusal", "content_filter"):
-                            return "[FINISH_REASON] Sorry I cannot assist with that request."
-                        else:
-                            print(f"Warning: {model} returned null content{diag_str}")
-                            return f"[ERROR] Model returned null content, finishing reason: {finish_reason}"
-                    
-                    # print the reasoning content for vertex ai models for debugging
-                    # if model.startswith("vertex_ai/") and vertex_thinking_mode:
-                    #     try:
-                    #         print(completion.choices[0].model_extra['message'].reasoning_content)
-                    #     except Exception as e:
-                    #         print(f"Could not display thinking process: {e}")
+            async def _request():
+                completion = await acompletion(**completion_args)
+                choice = completion.choices[0]
+                response_content = choice.message.content
 
-                    if model == "o4-mini" or model == "o3":
-                        global TOTAL_REASONING_TOKENS, REASONING_RESPONSES_COUNT
-                        reasoning_tokens = None
-                        try:
-                            reasoning_tokens = completion.model_extra['usage'].completion_tokens_details.reasoning_tokens
-                            TOTAL_REASONING_TOKENS += reasoning_tokens
-                            REASONING_RESPONSES_COUNT += 1
-                        except Exception as e:
-                            print(f"Could not extract or process reasoning tokens for o4-mini: {e}")
-                        
-                    return response_content # Return the stored content
-                except (litellm.RateLimitError, litellm.BadGatewayError, NullContentRetryableError) as e: # Retry with backoff for rate limits, server errors, and null content with stop
-                    if isinstance(e, NullContentRetryableError):
-                        error_type = "Null content (stop)"
-                        diag_str = f" ({', '.join(f'{k}: {v}' for k, v in e.diagnostic_info.items())})" if e.diagnostic_info else ""
-                        error_msg = f"{error_type} for {model}: finish_reason={e.finish_reason}{diag_str}"
-                    elif isinstance(e, litellm.RateLimitError):
-                        error_type = "Rate limit"
-                        error_msg = f"{error_type} for {model}: {e}"
-                    else:
-                        error_type = "Server error (5xx)"
-                        error_msg = f"{error_type} for {model}: {e}"
-                    
-                    print(f"{error_msg}. Attempt {sleep_attempts + 1}/{max_attempts}.")
-                    sleep_attempts += 1
-                    if sleep_attempts >= max_attempts:
-                        print(f"Max attempts reached for {model}. Error: {e}")
-                        return f"[ERROR] Error processing prompt after multiple retries: {e}"
-                    print(f"Waiting for {current_sleep_time} seconds before retrying...")
-                    await asyncio.sleep(current_sleep_time) # Use asyncio.sleep for async functions
-                    current_sleep_time *= backoff_factor
-                except litellm.BadRequestError as e:
-                    print(f"Bad request error for {model}, using fallback refusal response.: {e}.")
-                    return f"[BAD_REQUEST] Sorry I cannot assist with that request."
-                except Exception as e:
-                    print(f"Non-retryable error processing prompt for {model}: {e}")
-                    return f"[ERROR] Error processing prompt: {e}"
-            return f"[ERROR] Max retries exceeded for {model}."
+                if response_content is None:
+                    diagnostic_info = {}
+                    if hasattr(choice, "finish_reason") and choice.finish_reason:
+                        diagnostic_info["finish_reason"] = choice.finish_reason
+                    if hasattr(choice, "stop_reason") and choice.stop_reason:
+                        diagnostic_info["stop_reason"] = choice.stop_reason
+                    if hasattr(choice.message, "refusal") and choice.message.refusal:
+                        diagnostic_info["refusal"] = choice.message.refusal
+                    if hasattr(completion, "model_extra") and completion.model_extra:
+                        diagnostic_info["model_extra_keys"] = list(
+                            completion.model_extra.keys()
+                        )
+                    message_attrs = [
+                        attr
+                        for attr in dir(choice.message)
+                        if not attr.startswith("_") and attr != "content"
+                    ]
+                    if message_attrs:
+                        diagnostic_info["message_attrs"] = message_attrs[:5]
 
-        # Orchestrate calls to process_messages
-        # if "claude" in model.lower() or model.startswith("anthropic/"):
-        #     responses = []
-        #     for message_list in tqdm(message_collection, desc=f"Processing prompts for {model} sequentially"):
-        #         response = await process_messages(message_list)
-        #         responses.append(response)
-        # else: # For other (non-Anthropic) cloud models, use concurrency
-        tasks = [process_messages(message_list) for message_list in tqdm(message_collection, desc=f"Processing prompts for {model} concurrently")]
+                    finish_reason = diagnostic_info.get("finish_reason", "None/unknown")
+
+                    if finish_reason == "stop":
+                        raise NullContentRetryableError(finish_reason, diagnostic_info)
+
+                    diag_str = (
+                        f" ({', '.join(f'{k}: {v}' for k, v in diagnostic_info.items())})"
+                        if diagnostic_info
+                        else ""
+                    )
+
+                    if diagnostic_info.get("finish_reason") in (
+                        "refusal",
+                        "content_filter",
+                    ):
+                        return (
+                            "[FINISH_REASON] Sorry I cannot assist with that request."
+                        )
+                    print(f"Warning: {model} returned null content{diag_str}")
+                    return f"[ERROR] Model returned null content, finishing reason: {finish_reason}"
+
+                return response_content
+
+            try:
+                return await _retry_with_backoff(_request)
+            except (
+                litellm.RateLimitError,
+                litellm.BadGatewayError,
+                NullContentRetryableError,
+            ) as e:
+                print(f"Max attempts reached for {model}. Error: {e}")
+                return f"[ERROR] Error processing prompt after multiple retries: {e}"
+            except litellm.BadRequestError as e:
+                print(
+                    f"Bad request error for {model}, using fallback refusal response.: {e}."
+                )
+                return "[BAD_REQUEST] Sorry I cannot assist with that request."
+            except Exception as e:
+                print(f"Non-retryable error processing prompt for {model}: {e}")
+                return f"[ERROR] Error processing prompt: {e}"
+
+        tasks = [
+            process_messages(message_list)
+            for message_list in tqdm(
+                message_collection, desc=f"Processing prompts for {model} concurrently"
+            )
+        ]
         responses = await asyncio.gather(*tasks)
 
     if postprocess_responses:
         responses = [postprocess_message(response) for response in responses]
-
-    if model == "o4-mini" and REASONING_RESPONSES_COUNT > 0:
-        average_reasoning_tokens = TOTAL_REASONING_TOKENS / REASONING_RESPONSES_COUNT
-        print(f"Average reasoning tokens per o4-mini response: {average_reasoning_tokens:.2f} (Total: {TOTAL_REASONING_TOKENS}, Count: {REASONING_RESPONSES_COUNT})")
 
     return responses
