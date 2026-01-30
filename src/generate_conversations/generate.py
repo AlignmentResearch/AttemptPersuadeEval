@@ -7,9 +7,7 @@ import re
 import time
 import logging
 from tqdm import tqdm
-import torch
 from litellm import acompletion
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 import litellm  # Add import for litellm to access RateLimitError
 from typing import Any, Dict, List
 import openai  # Add OpenAI import for direct API calls
@@ -37,6 +35,21 @@ REASONING_RESPONSES_COUNT = 0
 
 # Cache for storing loaded pipeline generators
 MODEL_CACHE = {}
+
+
+def _require_local_llm_deps():
+    """
+    Lazily import local-model dependencies to avoid requiring them for API-only runs.
+    """
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Local model dependencies are not installed. Install with "
+            "`pip install -r reqs-all.txt` or `pip install -e \".[local]\"`."
+        ) from exc
+    return torch, AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 
 
 
@@ -103,6 +116,9 @@ def preload_local_model(model_name):
         return True
 
     try:
+        torch, AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig = (
+            _require_local_llm_deps()
+        )
         local_path = f"src/ckpts/{model_name.split('/')[-1]}"
         print(f"Preloading model {model_name}...")
 
@@ -343,6 +359,7 @@ def generate_with_local_model(
     Returns:
         List of generated responses
     """
+    torch, AutoModelForCausalLM, AutoTokenizer, pipeline, _ = _require_local_llm_deps()
     local_path = f"src/ckpts/{model.split('/')[-1]}"
 
     # Check if generator pipeline is already loaded in cache
@@ -600,7 +617,7 @@ async def generate_llm(
                         # For other finish reasons, handle as before
                         diag_str = f" ({', '.join(f'{k}: {v}' for k, v in diagnostic_info.items())})" if diagnostic_info else ""
                         
-                        if diagnostic_info.get('finish_reason') == 'refusal':
+                        if diagnostic_info.get('finish_reason') in ("refusal", "content_filter"):
                             return "[FINISH_REASON] Sorry I cannot assist with that request."
                         else:
                             print(f"Warning: {model} returned null content{diag_str}")

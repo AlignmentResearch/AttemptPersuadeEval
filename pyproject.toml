@@ -16,9 +16,6 @@ dependencies = [
     "google-cloud-aiplatform",
     "seaborn",
     "scikit-learn",
-    "transformers",
-    "torch",
-    "accelerate",
     "tabulate",
     "hydra-core"
 ]
@@ -39,6 +36,11 @@ dev = [
 test = [
     "pytest",
     "pytest-asyncio"
+]
+local = [
+    "transformers",
+    "torch",
+    "accelerate"
 ]
 
 [tool.logviz-dependencies]
