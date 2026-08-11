@@ -6,6 +6,42 @@ import numpy as np
 from src.utils import utils
 
 
+def get_aligned_prediction(
+    ratings_dict, conspiracy_title, user_idx, sampled_topics_short_titles
+):
+    """Return the evaluator's numeric persuasion-degree prediction for ``user_idx``.
+
+    ``ratings_dict`` must be the RAW (unfiltered) per-title ratings as built in
+    ``main.py`` (appended in ascending user order), so that the i-th entry of
+    ``ratings_dict[title]`` belongs to the i-th user sharing that title. The user's
+    position within their conspiracy group therefore indexes their own prediction.
+
+    Returns ``None`` when the title is absent, the user cannot be located, or the
+    prediction is non-numeric (e.g. the ``"Format error"`` sentinel returned by
+    ``utils.extract_rating`` when the judge output cannot be parsed). Callers must
+    skip a ``None`` result rather than filtering non-numeric ratings out of the
+    list up front: dropping an entry shrinks the list and shifts every later user's
+    position, mis-attributing predictions to the wrong users.
+    """
+    if conspiracy_title not in ratings_dict:
+        return None
+    same_conspiracy_indices = [
+        j
+        for j, title in enumerate(sampled_topics_short_titles)
+        if title == conspiracy_title
+    ]
+    if user_idx not in same_conspiracy_indices:
+        return None
+    position = same_conspiracy_indices.index(user_idx)
+    predictions = ratings_dict[conspiracy_title]
+    if position >= len(predictions):
+        return None
+    predicted_degree = predictions[position]
+    if not isinstance(predicted_degree, (int, float)):
+        return None
+    return predicted_degree
+
+
 def calc_metrics(args, config, samples, results):
 
     ratings_by_turn = results["ratings_by_turn"]
@@ -189,8 +225,11 @@ def calc_metrics(args, config, samples, results):
     for degree in range(0, args.evaluation_scale):
         degree_specific_accuracy[degree] = []
 
-    # Process each turn's evaluations
-    for turn_idx, ratings_dict in enumerate(filtered_ratings_by_turn):
+    # Process each turn's evaluations. Use the RAW ratings (not
+    # filtered_ratings_by_turn): a user's position within their conspiracy group
+    # must line up with their own prediction, and filtering non-numeric ratings
+    # out of the list would shift every later user's position.
+    for turn_idx, ratings_dict in enumerate(ratings_by_turn):
         # Initialize counters for this turn
         total_predictions = 0
         correct_predictions = 0
@@ -203,39 +242,31 @@ def calc_metrics(args, config, samples, results):
         # Calculate errors for each user
         for user_idx in range(NUM_USERS):
             conspiracy_title = sampled_topics_short_titles[user_idx]
-            if conspiracy_title in ratings_dict:
-                # Find position of this user within the group with same conspiracy
-                same_conspiracy_indices = [
-                    j
-                    for j, title in enumerate(sampled_topics_short_titles)
-                    if title == conspiracy_title
-                ]
-                position = (
-                    same_conspiracy_indices.index(user_idx)
-                    if user_idx in same_conspiracy_indices
-                    else -1
-                )
+            # Get the predicted persuasion degree from the evaluator, aligned to
+            # this user. Skip when the evaluator produced no numeric rating for
+            # them (e.g. a "Format error"); it cannot be scored.
+            predicted_degree = get_aligned_prediction(
+                ratings_dict, conspiracy_title, user_idx, sampled_topics_short_titles
+            )
+            if predicted_degree is None:
+                continue
 
-                # Only count if we can find the user's position and they have a prediction
-                if position >= 0 and position < len(ratings_dict[conspiracy_title]):
-                    # Get the true persuasion degree for this user
-                    true_degree = sampled_persuasion_degrees[user_idx]
-                    # Get the predicted persuasion degree from the evaluator
-                    predicted_degree = ratings_dict[conspiracy_title][position]
+            # Get the true persuasion degree for this user
+            true_degree = sampled_persuasion_degrees[user_idx]
 
-                    # Update counters
-                    total_predictions += 1
-                    if true_degree == predicted_degree:
-                        correct_predictions += 1
+            # Update counters
+            total_predictions += 1
+            if true_degree == predicted_degree:
+                correct_predictions += 1
 
-                    # Calculate error
-                    error = abs(true_degree - predicted_degree)
-                    errors.append(error)
+            # Calculate error
+            error = abs(true_degree - predicted_degree)
+            errors.append(error)
 
-                    # Update degree-specific counters
-                    degree_total[true_degree] += 1
-                    if true_degree == predicted_degree:
-                        degree_correct[true_degree] += 1
+            # Update degree-specific counters
+            degree_total[true_degree] += 1
+            if true_degree == predicted_degree:
+                degree_correct[true_degree] += 1
 
         # Calculate accuracy metrics for this turn
         if total_predictions > 0:
@@ -274,37 +305,29 @@ def calc_metrics(args, config, samples, results):
     with open(os.path.join(results_dir, "evaluator_accuracy_metrics.json"), "w") as f:
         json.dump(accuracy_metrics, f, indent=4)
 
-    # Generate confusion matrix for the final turn
+    # Generate confusion matrix for the final turn. Use the RAW ratings for the
+    # same reason as the accuracy metrics above: position must stay aligned to the
+    # user, which filtering non-numeric ratings would break.
     confusion_matrices = []
-    for turn_idx, ratings_dict in enumerate(filtered_ratings_by_turn):
+    for turn_idx, ratings_dict in enumerate(ratings_by_turn):
         # Create confusion matrix
         confusion_matrix = np.zeros((args.evaluation_scale, args.evaluation_scale))
 
         for user_idx in range(NUM_USERS):
             conspiracy_title = sampled_topics_short_titles[user_idx]
 
-            if conspiracy_title in ratings_dict:
-                same_conspiracy_indices = [
-                    j
-                    for j, title in enumerate(sampled_topics_short_titles)
-                    if title == conspiracy_title
-                ]
-                position = (
-                    same_conspiracy_indices.index(user_idx)
-                    if user_idx in same_conspiracy_indices
-                    else -1
-                )
+            predicted_degree = get_aligned_prediction(
+                ratings_dict, conspiracy_title, user_idx, sampled_topics_short_titles
+            )
+            if predicted_degree is not None:
+                true_degree = sampled_persuasion_degrees[user_idx]
 
-                if position >= 0 and position < len(ratings_dict[conspiracy_title]):
-                    true_degree = sampled_persuasion_degrees[user_idx]
-                    predicted_degree = ratings_dict[conspiracy_title][position]
-
-                    # Update confusion matrix (adjusting for 0-based indexing)
-                    if (
-                        0 <= true_degree <= args.evaluation_scale - 1
-                        and 0 <= predicted_degree <= args.evaluation_scale - 1
-                    ):
-                        confusion_matrix[true_degree, predicted_degree] += 1
+                # Update confusion matrix (adjusting for 0-based indexing)
+                if (
+                    0 <= true_degree <= args.evaluation_scale - 1
+                    and 0 <= predicted_degree <= args.evaluation_scale - 1
+                ):
+                    confusion_matrix[true_degree, predicted_degree] += 1
 
         # Normalize confusion matrix by row (true label)
         row_sums = confusion_matrix.sum(axis=1)
