@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import pearsonr
 
+from src.metrics.calc_metrics import get_aligned_prediction
+
 
 def create_visualizations(args, config, samples, results):
 
@@ -32,37 +34,30 @@ def create_visualizations(args, config, samples, results):
     user_belief_ratings = results["user_belief_ratings"]
     ratings_by_turn = results["ratings_by_turn"]
 
-    # Create confusion matrix heatmap of predicted vs actual persuasion degrees for the final turn
-    if len(filtered_ratings_by_turn) > 0:  # todo: fix off by one error here
-        last_turn_idx = len(filtered_ratings_by_turn) - 1
+    # Create confusion matrix heatmap of predicted vs actual persuasion degrees for the final turn.
+    # Use the RAW ratings (not filtered_ratings_by_turn): a user's position within
+    # their conspiracy group must line up with their own prediction, and filtering
+    # non-numeric ratings out of the list shifts every later user's position.
+    if len(ratings_by_turn) > 0:
+        last_turn_idx = len(ratings_by_turn) - 1
         confusion_matrix = np.zeros((args.evaluation_scale, args.evaluation_scale))
+        ratings_dict = ratings_by_turn[last_turn_idx]
 
         for user_idx in range(NUM_USERS):
             conspiracy_title = sampled_topics_short_titles[user_idx]
-            ratings_dict = filtered_ratings_by_turn[last_turn_idx]
 
-            if conspiracy_title in ratings_dict:
-                same_conspiracy_indices = [
-                    j
-                    for j, title in enumerate(sampled_topics_short_titles)
-                    if title == conspiracy_title
-                ]
-                position = (
-                    same_conspiracy_indices.index(user_idx)
-                    if user_idx in same_conspiracy_indices
-                    else -1
-                )
+            predicted_degree = get_aligned_prediction(
+                ratings_dict, conspiracy_title, user_idx, sampled_topics_short_titles
+            )
+            if predicted_degree is not None:
+                true_degree = sampled_persuasion_degrees[user_idx]
 
-                if position >= 0 and position < len(ratings_dict[conspiracy_title]):
-                    true_degree = sampled_persuasion_degrees[user_idx]
-                    predicted_degree = ratings_dict[conspiracy_title][position]
-
-                    # Update confusion matrix (adjusting for 0-based indexing)
-                    if (
-                        0 <= true_degree <= args.evaluation_scale - 1
-                        and 0 <= predicted_degree <= args.evaluation_scale - 1
-                    ):
-                        confusion_matrix[true_degree, predicted_degree] += 1
+                # Update confusion matrix (adjusting for 0-based indexing)
+                if (
+                    0 <= true_degree <= args.evaluation_scale - 1
+                    and 0 <= predicted_degree <= args.evaluation_scale - 1
+                ):
+                    confusion_matrix[true_degree, predicted_degree] += 1
 
         # Normalize confusion matrix by row (true label)
         row_sums = confusion_matrix.sum(axis=1)
