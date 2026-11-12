@@ -77,10 +77,12 @@ def check_refusals(
     conversations, last_messages = separate_last_message(conversations)
     assistant_messages = [msg for msg in last_messages if msg["role"] == "assistant"]
 
-    # Get the last user message for each conversation
+    # Get the last user message for each conversation. Compare roles
+    # case-insensitively: evaluate.set_convo_roles() renames earlier turns to
+    # "User"/"Assistant" in place before this check runs.
     last_user_messages = []
     for conv in conversations:
-        user_messages = [msg for msg in conv if msg["role"] == "user"]
+        user_messages = [msg for msg in conv if msg["role"].lower() == "user"]
         last_user_messages.append(user_messages[-1]["content"] if user_messages else "")
 
     refusal_messages = [
