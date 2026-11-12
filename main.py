@@ -389,9 +389,17 @@ def main(cfg: DictConfig) -> None:
                 )
     else:
         # Otherwise use LLM to generate initial user messages
-        message_collection = conversation.add_to_convo(
-            message_collection, model=PERSUADEE_MODEL, batch_size=cfg.batch_size
+        seeded_collection = [
+            [conv[0], {"role": "user", "content": topic}]
+            for conv, topic in zip(message_collection, sampled_topics)
+        ]
+        seeded_collection = conversation.add_to_convo(
+            seeded_collection, model=PERSUADEE_MODEL, batch_size=cfg.batch_size
         )
+        message_collection = [
+            [conv[0], {"role": "user", "content": conv[-1]["content"]}]
+            for conv in seeded_collection
+        ]
 
     # After sampling a response, record the conversation
     last_sampled = [conv[-1] for conv in message_collection]
